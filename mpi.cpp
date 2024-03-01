@@ -3,13 +3,39 @@
 #include <stdio.h>
 #include <cmath>
 #include <vector>
+#include <unordered_set>
 
 // Put any static global variables here that you will use throughout the simulation.
+static int grid_dimension;
+std::unordered_set<int> rank_part_ids;
+std::unordered_set<int> rank_ghost_part_ids;
+static std::vector<std::vector<particle_t*>> grids;
+
+// Helper routine returning the index of the block that particle p belongs to.
+int get_block_index(particle_t* p) {
+    return floor(p->x / cutoff) + floor(p->y / cutoff) * grid_dimension;
+}
 
 void init_simulation(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
 	// You can use this space to initialize data objects that you may need
 	// This function will be called once before the algorithm begins
 	// Do not do any particle simulation here
+
+    // Setup grids each with cutoff-by-cutoff dimensions.
+    grid_dimension = ceil(size / cutoff);
+    int total_grid_count = grid_dimension * grid_dimension;
+
+    // Store particles in a row-major order 2D grid
+    grids.resize(total_grid_count);
+    for (int i = 0; i < num_parts; i++) {
+        particle_t* p = parts + i;
+        int block_index = get_block_index(p);
+        grids[block_index].push_back(p);
+    }
+
+    // Assign particles to rank
+    
+
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
@@ -32,8 +58,8 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
     std::vector<particle_t> receiving_parts(num_parts); // Size
 
     // Add particles from processor to be sent for gathering
-    for (int i = 0; i < num_parts; i += 1) {
-        sending_parts.push_back(parts[i]);
+    for (const auto& id : rank_part_ids) {
+        sending_parts.push_back(parts[id]);
     }
 
     // Use variable gather due to particle count varying for each processor
