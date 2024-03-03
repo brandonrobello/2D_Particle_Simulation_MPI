@@ -13,6 +13,7 @@ struct grid_cell_t {
     int index;
     std::vector<particle_t*> particles;
     std::vector<particle_t*> ghost_particles;
+    std::vector<int> is_ghost_cell_to; // stores rank indices
     
     grid_cell_t* neighbor_up;
     grid_cell_t* neightbor_down;    
