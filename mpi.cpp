@@ -123,14 +123,14 @@ void build_bins(double size) {
     bin_count_y = static_cast<int>(size / bin_size);
     
     bins_frame_1.assign(bin_count_x, std::vector<Bin>(bin_count_y));
-    bins_frame_2.assign(bin_count_x, std::vector<Bin>(bin_count_y));
+    // bins_frame_2.assign(bin_count_x, std::vector<Bin>(bin_count_y));
     current_bins = &bins_frame_1;
-    next_bins    = &bins_frame_2;
+    // next_bins    = &bins_frame_2;
     
     for (int i = 0; i < bin_count_x; ++i) {
         for (int j = 0; j < bin_count_y; ++j) {
             bins_frame_1[i][j].particles.clear();
-            bins_frame_2[i][j].particles.clear();
+            // bins_frame_2[i][j].particles.clear();
         }
     }
     
@@ -147,13 +147,14 @@ void init_simulation(particle_t *parts, int num_parts, double size, int rank, in
     // Compute owned domain boundaries for this process (row decomposition)
     double y_min = size * rank / num_procs;
     double y_max = size * (rank + 1) / num_procs;
+
     // Extend the domain by cutoff (clamping at 0 and size)
     double ext_y_min = (y_min - cutoff < 0) ? 0 : y_min - cutoff;
     double ext_y_max = (y_max + cutoff > size) ? size : y_max + cutoff;
     
     local_particles.clear();
     for (int i = 0; i < num_parts; ++i) {
-        if (parts[i].y >= ext_y_min && parts[i].y < ext_y_max)
+        if (parts[i].y >= ext_y_min && parts[i].y <= ext_y_max)
             local_particles.push_back(parts[i]);
     }
     
@@ -162,46 +163,38 @@ void init_simulation(particle_t *parts, int num_parts, double size, int rank, in
 }
 
 void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
-    // Compute forces using optimized binning
-    compute_forces();
-    
-    // Reset next_bins
-    for (int i = 0; i < bin_count_x; ++i) {
-        for (int j = 0; j < bin_count_y; ++j) {
-            (*next_bins)[i][j].particles.clear();
-        }
-    }
-    
-    // Move particles and reassign to new bins
-    for (size_t i = 0; i < local_particles.size(); ++i) {
-        move(local_particles[i], size);
-        int bx, by;
-        get_bin_index(local_particles[i].x, local_particles[i].y, bx, by, size);
-        (*next_bins)[bx][by].particles.push_back(&local_particles[i]);
-    }
-    
-    // Swap frames
-    std::swap(current_bins, next_bins);
-
-    // Partition local_particles into owned and outgoing groups.
     double y_min = size * rank / num_procs;
     double y_max = size * (rank + 1) / num_procs;
-    std::vector<particle_t> remain;
-    std::vector<particle_t> send_up;   // particles with y >= y_max
-    std::vector<particle_t> send_down; // particles with y < y_min
-    
+
+    // Compute forces using optimized binning
+    compute_forces();
+
+    // Move owned particles
+    std::vector<particle_t> owned;
     for (size_t i = 0; i < local_particles.size(); ++i) {
-        double y = local_particles[i].y;
-        if (y >= y_min && y < y_max) {
-            remain.push_back(local_particles[i]);
-        } else if (y >= y_max && rank < num_procs - 1) {
-            send_up.push_back(local_particles[i]);
-        } else if (y < y_min && rank > 0) {
-            send_down.push_back(local_particles[i]);
-        } else {
-            // On boundary processes, particles that “drift” out are kept.
-            remain.push_back(local_particles[i]);
+        if (local_particles[i].y >= y_min && local_particles[i].y < y_max) {
+            move(local_particles[i], size);
+            owned.push_back(local_particles[i]);
         }
+    }
+
+    // Partition local_particles into owned and outgoing groups.
+    std::vector<particle_t> remain;
+    std::vector<particle_t> send_up;   // particles with y >= y_max - cutoff
+    std::vector<particle_t> send_down; // particles with y < y_min + cutoff
+    
+    for (size_t i = 0; i < owned.size(); ++i) {
+        double y = owned[i].y;
+
+        if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
+            (rank != num_procs - 1 && y >= y_min && y < y_max))
+            remain.push_back(owned[i]);
+        
+        if (y >= y_max - cutoff && rank < num_procs - 1)
+            send_up.push_back(owned[i]);
+
+        if (y <= y_min + cutoff && rank > 0)
+            send_down.push_back(owned[i]);
     }
 
     // Exchange outgoing particles with immediate neighbors
@@ -213,7 +206,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
         int count = send_up.size();
         MPI_Send(&count, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD);
         if (count > 0) {
-            MPI_Send(send_up.data(), count, PARTICLE, rank + 1, 0, MPI_COMM_WORLD);
+            MPI_Send(send_up.data(), count, PARTICLE, rank + 1, 1, MPI_COMM_WORLD);
         }
     }
     // All processors except the bottom-most receive from below.
@@ -222,7 +215,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
         MPI_Recv(&count, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         if (count > 0) {
             recv_from_lower.resize(count);
-            MPI_Recv(recv_from_lower.data(), count, PARTICLE, rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(recv_from_lower.data(), count, PARTICLE, rank - 1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
     }
 
@@ -230,18 +223,18 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     // All processors except the bottom-most send their downward-moving particles.
     if (rank != 0) {
         int count = send_down.size();
-        MPI_Send(&count, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD);
+        MPI_Send(&count, 1, MPI_INT, rank - 1, 2, MPI_COMM_WORLD);
         if (count > 0) {
-            MPI_Send(send_down.data(), count, PARTICLE, rank - 1, 0, MPI_COMM_WORLD);
+            MPI_Send(send_down.data(), count, PARTICLE, rank - 1, 3, MPI_COMM_WORLD);
         }
     }
     // All processors except the top-most receive from above.
     if (rank != num_procs - 1) {
         int count;
-        MPI_Recv(&count, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&count, 1, MPI_INT, rank + 1, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         if (count > 0) {
             recv_from_upper.resize(count);
-            MPI_Recv(recv_from_upper.data(), count, PARTICLE, rank + 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(recv_from_upper.data(), count, PARTICLE, rank + 1, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
     }
 
