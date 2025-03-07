@@ -4,6 +4,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <cstdio>
 
 // Precomputed constants
 static const double cutoff2 = cutoff * cutoff;
@@ -18,9 +19,8 @@ struct Bin {
 };
 
 // 2D grid of bins for two frames
-std::vector<std::vector<Bin>> bins_frame_1, bins_frame_2;
+std::vector<std::vector<Bin>> bins_frame_1;
 std::vector<std::vector<Bin>>* current_bins;
-std::vector<std::vector<Bin>>* next_bins;
 int bin_count_x, bin_count_y;
 
 // Global vector holding the local copy of particles for this process
@@ -84,8 +84,8 @@ inline void get_bin_index(double x, double y, int& bx, int& by, double size) {
     by = std::max(0, std::min(by, bin_count_y - 1));
 }
 
-// Helper: Apply force using binning data for a particle in a given bin
-inline void apply_force_binning(particle_t &particle, Bin &bin) {
+// Apply force with binning for all neighbors of a particle
+inline void apply_force_binning(particle_t& particle, Bin& bin) {
     for (auto neighbor : bin.particles) {
         if (neighbor != &particle) {
             apply_force(particle, *neighbor);
@@ -93,18 +93,18 @@ inline void apply_force_binning(particle_t &particle, Bin &bin) {
     }
 }
 
-// compute_forces: Loop over bins and compute forces on each particle
+// Optimized force calculation considering only necessary bins
 void compute_forces() {
     for (int i = 0; i < bin_count_x; ++i) {
         for (int j = 0; j < bin_count_y; ++j) {
-            Bin &bin = (*current_bins)[i][j];
+            Bin& bin = (*current_bins)[i][j];
+
             for (auto p : bin.particles) {
-                // Reset accelerations
-                p->ax = 0;
-                p->ay = 0;
-                // Apply forces from all particles in neighboring bins (including self-bin)
-                for (int dx = -1; dx <= 1; ++dx) {
-                    for (int dy = -1; dy <= 1; ++dy) {
+                // Reset acceleration before force accumulation
+                p->ax = p->ay = 0;
+                // Check self-bin and neighboring bins within cutoff
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dy = -1; dy <= 1; dy++) {
                         int ni = i + dx;
                         int nj = j + dy;
                         if (ni >= 0 && ni < bin_count_x && nj >= 0 && nj < bin_count_y) {
@@ -123,14 +123,11 @@ void build_bins(double size) {
     bin_count_y = static_cast<int>(size / bin_size);
     
     bins_frame_1.assign(bin_count_x, std::vector<Bin>(bin_count_y));
-    // bins_frame_2.assign(bin_count_x, std::vector<Bin>(bin_count_y));
     current_bins = &bins_frame_1;
-    // next_bins    = &bins_frame_2;
     
     for (int i = 0; i < bin_count_x; ++i) {
         for (int j = 0; j < bin_count_y; ++j) {
             bins_frame_1[i][j].particles.clear();
-            // bins_frame_2[i][j].particles.clear();
         }
     }
     
@@ -141,7 +138,6 @@ void build_bins(double size) {
         (*current_bins)[bx][by].particles.push_back(&local_particles[i]);
     }
 }
-
 
 void init_simulation(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
     // Compute owned domain boundaries for this process (row decomposition)
@@ -172,13 +168,15 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     // Move owned particles
     std::vector<particle_t> owned;
     for (size_t i = 0; i < local_particles.size(); ++i) {
-        if (local_particles[i].y >= y_min && local_particles[i].y < y_max) {
+        double y = local_particles[i].y;
+        if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
+            (rank != num_procs - 1 && y >= y_min && y < y_max)) {
             move(local_particles[i], size);
             owned.push_back(local_particles[i]);
         }
     }
 
-    // Partition local_particles into owned and outgoing groups.
+    // Partition owned particles into remaining and outgoing
     std::vector<particle_t> remain;
     std::vector<particle_t> send_up;   // particles with y >= y_max - cutoff
     std::vector<particle_t> send_down; // particles with y < y_min + cutoff
@@ -197,7 +195,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
             send_down.push_back(owned[i]);
     }
 
-    // Exchange outgoing particles with immediate neighbors
+    // Exchange particles with immediate neighbors
     std::vector<particle_t> recv_from_lower, recv_from_upper;
 
     // Upward exchange:
@@ -238,12 +236,29 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
         }
     }
 
-    // Combine remaining particles with those received.
+    // Update local particles
     local_particles = remain;
     local_particles.insert(local_particles.end(), recv_from_lower.begin(), recv_from_lower.end());
     local_particles.insert(local_particles.end(), recv_from_upper.begin(), recv_from_upper.end());
 
-    // Rebuild bins for the next simulation step.
+    // Print total number of particles after one step
+    // std::vector<particle_t> after_owned;
+    // for (size_t i = 0; i < local_particles.size(); ++i) {
+    //     double y = local_particles[i].y;
+    //     if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
+    //         (rank != num_procs - 1 && y >= y_min && y < y_max)) {
+    //         after_owned.push_back(local_particles[i]);
+    //     }
+    // }
+
+    // int local_particle_count = after_owned.size();
+    // int total_particle_count;
+    // MPI_Reduce(&local_particle_count, &total_particle_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    // if (rank == 0) {
+    //     printf("Total number of particles after simulate_one_step: %d\n", total_particle_count);
+    // }
+
+    // Rebuild bins
     build_bins(size);
 }
 
@@ -290,5 +305,7 @@ void gather_for_save(particle_t *parts, int num_parts, double size, int rank, in
         for (int i = 0; i < total_owned && i < num_parts; ++i) {
             parts[i] = all_particles[i];
         }
+
+        // printf("Total number of particles after gather_for_save: %d\n", total_owned);
     }
 }
