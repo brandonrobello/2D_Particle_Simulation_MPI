@@ -69,12 +69,6 @@ inline void move(particle_t& p, double size) {
 
 // Compute bin index for a given position
 inline void get_bin_index(double x, double y, int& bx, int& by, double size) {
-    // Apply the same reflection logic as move()
-    if (x < 0) x = -x;
-    if (x > size) x = 2 * size - x;
-    if (y < 0) y = -y;
-    if (y > size) y = 2 * size - y;
-
     // Compute bin indices
     bx = static_cast<int>(x / bin_size);
     by = static_cast<int>(y / bin_size);
@@ -87,7 +81,7 @@ inline void get_bin_index(double x, double y, int& bx, int& by, double size) {
 // Apply force with binning for all neighbors of a particle
 inline void apply_force_binning(particle_t& particle, Bin& bin) {
     for (auto neighbor : bin.particles) {
-        if (neighbor != &particle) {
+        if (neighbor->id != particle.id) {
             apply_force(particle, *neighbor);
         }
     }
@@ -119,15 +113,9 @@ void compute_forces() {
 
 // Build the binning data structures from local_particles
 void build_bins(double size) {
-    bin_count_x = static_cast<int>(size / bin_size);
-    bin_count_y = static_cast<int>(size / bin_size);
-    
-    bins_frame_1.assign(bin_count_x, std::vector<Bin>(bin_count_y));
-    current_bins = &bins_frame_1;
-    
     for (int i = 0; i < bin_count_x; ++i) {
         for (int j = 0; j < bin_count_y; ++j) {
-            bins_frame_1[i][j].particles.clear();
+            (*current_bins)[i][j].particles.clear();
         }
     }
     
@@ -155,12 +143,21 @@ void init_simulation(particle_t *parts, int num_parts, double size, int rank, in
     }
     
     // Build the bins from the local particles.
+    bin_count_x = static_cast<int>(size / bin_size);
+    bin_count_y = static_cast<int>(size / bin_size);
+
+    bins_frame_1.assign(bin_count_x, std::vector<Bin>(bin_count_y));
+    current_bins = &bins_frame_1;
+
     build_bins(size);
 }
 
 void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
     double y_min = size * rank / num_procs;
     double y_max = size * (rank + 1) / num_procs;
+
+    double ext_y_min = (y_min - cutoff < 0) ? 0 : y_min - cutoff;
+    double ext_y_max = (y_max + cutoff > size) ? size : y_max + cutoff;
 
     // Compute forces using optimized binning
     compute_forces();
@@ -184,8 +181,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     for (size_t i = 0; i < owned.size(); ++i) {
         double y = owned[i].y;
 
-        if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
-            (rank != num_procs - 1 && y >= y_min && y < y_max))
+        if (y >= ext_y_min && y <= ext_y_max)
             remain.push_back(owned[i]);
         
         if (y >= y_max - cutoff && rank < num_procs - 1)
@@ -241,23 +237,6 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     local_particles.insert(local_particles.end(), recv_from_lower.begin(), recv_from_lower.end());
     local_particles.insert(local_particles.end(), recv_from_upper.begin(), recv_from_upper.end());
 
-    // Print total number of particles after one step
-    // std::vector<particle_t> after_owned;
-    // for (size_t i = 0; i < local_particles.size(); ++i) {
-    //     double y = local_particles[i].y;
-    //     if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
-    //         (rank != num_procs - 1 && y >= y_min && y < y_max)) {
-    //         after_owned.push_back(local_particles[i]);
-    //     }
-    // }
-
-    // int local_particle_count = after_owned.size();
-    // int total_particle_count;
-    // MPI_Reduce(&local_particle_count, &total_particle_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
-    // if (rank == 0) {
-    //     printf("Total number of particles after simulate_one_step: %d\n", total_particle_count);
-    // }
-
     // Rebuild bins
     build_bins(size);
 }
@@ -308,7 +287,5 @@ void gather_for_save(particle_t *parts, int num_parts, double size, int rank, in
         for (int i = 0; i < total_owned && i < num_parts; ++i) {
             parts[i] = all_particles[i];
         }
-
-        // printf("Total number of particles after gather_for_save: %d\n", total_owned);
     }
 }
