@@ -19,8 +19,8 @@ struct Bin {
 };
 
 // 2D grid of bins for two frames
-std::vector<std::vector<Bin>> bins_frame_1;
-std::vector<std::vector<Bin>>* current_bins;
+static std::vector<std::vector<Bin>> bins_frame_1;
+static std::vector<std::vector<Bin>>* current_bins;
 int bin_count_x, bin_count_y;
 
 // Global vector holding the local copy of particles for this process
@@ -179,7 +179,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     // Partition owned particles into remaining and outgoing
     std::vector<particle_t> remain;
     std::vector<particle_t> send_up;   // particles with y >= y_max - cutoff
-    std::vector<particle_t> send_down; // particles with y < y_min + cutoff
+    std::vector<particle_t> send_down; // particles with y <= y_min + cutoff
     
     for (size_t i = 0; i < owned.size(); ++i) {
         double y = owned[i].y;
@@ -265,10 +265,14 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
 void gather_for_save(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
     double y_min = size * rank / num_procs;
     double y_max = size * (rank + 1) / num_procs;
+
     std::vector<particle_t> owned;
     for (size_t i = 0; i < local_particles.size(); ++i) {
-        if (local_particles[i].y >= y_min && local_particles[i].y < y_max)
+        double y = local_particles[i].y;
+        if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
+            (rank != num_procs - 1 && y >= y_min && y < y_max)) {
             owned.push_back(local_particles[i]);
+        }
     }
     
     int local_owned = owned.size();
@@ -276,8 +280,7 @@ void gather_for_save(particle_t *parts, int num_parts, double size, int rank, in
     if (rank == 0) {
         recv_counts.resize(num_procs);
     }
-    MPI_Gather(&local_owned, 1, MPI_INT,
-               recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&local_owned, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
     
     std::vector<int> displs;
     int total_owned = 0;
