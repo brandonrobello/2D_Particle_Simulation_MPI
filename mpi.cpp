@@ -5,28 +5,63 @@
 #include <cstdio>
 #include <iostream>
 #include <algorithm>
+#include <map>
+
+int total_within_cutoff;
 
 // ================== Left Alone ==============================
 
 // Apply the force from neighbor to particle
-void apply_force(particle_t& particle, particle_t& neighbor) {
+// void apply_force(particle_t& particle, particle_t& neighbor) {
+//     // Calculate Distance
+//     double dx = neighbor.x - particle.x;
+//     double dy = neighbor.y - particle.y;
+//     double r2 = dx * dx + dy * dy;
+
+//     // Check if the two particles should interact
+//     if (r2 > cutoff * cutoff){
+//         printf("DEBUG: Skipping interaction - Particle ID %ld and Neighbor ID %ld, r2 = %.6f, cutoff^2 = %.6f\n",
+//         particle.id, neighbor.id, r2, cutoff * cutoff);
+//         return;
+//     }
+
+//     r2 = fmax(r2, min_r * min_r);
+//     double r = sqrt(r2);
+
+//     // Very simple short-range repulsive force
+//     double coef = (1 - cutoff / r) / r2 / mass;
+//     particle.ax += coef * dx;
+//     particle.ay += coef * dy;
+// }
+
+void apply_force(particle_t& p1, particle_t& p2) {
     // Calculate Distance
-    double dx = neighbor.x - particle.x;
-    double dy = neighbor.y - particle.y;
+    double dx = p2.x - p1.x;
+    double dy = p2.y - p1.y;
     double r2 = dx * dx + dy * dy;
 
     // Check if the two particles should interact
-    if (r2 > cutoff * cutoff)
+    if (r2 > cutoff * cutoff) {
+        printf("DEBUG: Skipping interaction - Particle ID %ld and Neighbor ID %ld, r2 = %.6f, cutoff^2 = %.6f\n",
+               p1.id, p2.id, r2, cutoff * cutoff);
         return;
+    }
 
     r2 = fmax(r2, min_r * min_r);
     double r = sqrt(r2);
 
     // Very simple short-range repulsive force
     double coef = (1 - cutoff / r) / r2 / mass;
-    particle.ax += coef * dx;
-    particle.ay += coef * dy;
+    double fx = coef * dx;
+    double fy = coef * dy;
+
+    // Apply forces symmetrically to both particles
+    p1.ax += fx;
+    p1.ay += fy;
+    p2.ax -= fx;  // Apply equal and opposite force
+    p2.ay -= fy;
 }
+
 
 // Integrate the ODE
 void move(particle_t& p, double size) {
@@ -60,7 +95,7 @@ struct Bin {
 };
 
 // Global bins only used by Rank 0
-std::vector<std::vector<Bin>> global_bins_frame;
+std::vector<std::vector<Bin>> master_bins_frame;
 
 // Local bins for each rank
 std::vector<std::vector<Bin>> local_bins_frame;
@@ -106,7 +141,7 @@ void distribute_bins(int rank, int num_procs, double size) {
 
             for (int i = 0; i < bin_count_x; i++) {
                 for (int j = start_y; j < end_y; j++) {
-                    for (auto& p : global_bins_frame[i][j].particles) {
+                    for (auto& p : master_bins_frame[i][j].particles) {
                         send_particles.push_back(p);
                     }
                 }
@@ -131,6 +166,10 @@ void distribute_bins(int rank, int num_procs, double size) {
     MPI_Scatterv(send_particles.data(), send_counts.data(), displacements.data(), PARTICLE,
                  recv_particles.data(), recv_count, PARTICLE, 0, MPI_COMM_WORLD);
 
+    //DEBUG
+    // printf("Rank %d: Received %ld particles after distribution\n", rank, recv_particles.size());
+
+    
     // Assign received particles to local bins
     for (auto& p : recv_particles) {
         int bx, by;
@@ -138,7 +177,8 @@ void distribute_bins(int rank, int num_procs, double size) {
         local_bins_frame[bx][by].particles.push_back(p);
     }
 
-    printf("Rank %d: Received %d particles after distribution\n", rank, recv_particles.size());
+    // DEBUG
+    // printf("Rank %d: Received %d particles after distribution\n", rank, recv_particles.size());
 
 }
 
@@ -151,7 +191,7 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 
     // Resize global bins (Only Rank 0 needs this)
     if (rank == 0) {
-        global_bins_frame.assign(bin_count_x, std::vector<Bin>(bin_count_y));
+        master_bins_frame.assign(bin_count_x, std::vector<Bin>(bin_count_y));
     }
 
     // Resize local and ghost bins
@@ -171,7 +211,27 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
         current_start_index = end_bin_yindex[irank];
     }
 
-    printf("Rank %d: Handles bins from y-index %d to %d\n", rank, start_bin_yindex[rank], end_bin_yindex[rank]);
+    // ===================== Sanity Check: Before Distribution =====================
+    if (rank == 0) {
+        printf("\n[Sanity Check] Checking particle distances BEFORE distribution...\n");
+
+        total_within_cutoff = 0;
+        for (int i = 0; i < num_parts; i++) {
+            for (int j = i + 1; j < num_parts; j++) {
+                if (parts[i].id == parts[j].id) continue;
+
+                double dx = parts[j].x - parts[i].x;
+                double dy = parts[j].y - parts[i].y;
+                double r2 = dx * dx + dy * dy;
+
+                if (r2 <= cutoff * cutoff) {
+                    total_within_cutoff++;
+                }
+            }
+        }
+        printf("Rank 0: Total particle pairs within cutoff BEFORE distribution: %d\n\n", total_within_cutoff);
+    }
+    // ===================== Sanity Check: Before Distribution =====================
 
 
     if (rank == 0) {
@@ -179,9 +239,26 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
         for (int i = 0; i < num_parts; i++) {
             int bx, by;
             get_bin_index(parts[i].x, parts[i].y, bx, by, size);
-            global_bins_frame[bx][by].particles.push_back(parts[i]);
+            master_bins_frame[bx][by].particles.push_back(parts[i]);
         }
     }
+
+    // // DEBUG
+    // if (rank == 0) {
+    //     printf("\n--- Rank 0: Verifying All Particles Are in Global Bins ---\n");
+    
+    //     int total_particles = 0;
+    //     for (int j = 0; j < bin_count_y; j++) {
+    //         int row_particles = 0;
+    //         for (int i = 0; i < bin_count_x; i++) {
+    //             row_particles += master_bins_frame[i][j].particles.size();
+    //         }
+    //         total_particles += row_particles;
+    //         printf("Row %d: %d particles\n", j, row_particles);
+    //     }
+    
+    //     printf("Total particles in global bins: %d (should match num_parts = %d)\n", total_particles, num_parts);
+    // }
 
     // Broadcast metadata to all ranks
     MPI_Bcast(&bin_count_x, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -192,27 +269,94 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     // Send bins to each rank
     distribute_bins(rank, num_procs, size);
 
-    for (int i = 0; i < bin_count_x; i++) {
-        for (int j = 0; j < bin_count_y; j++) {
-            printf("Rank %d: Bin (%d, %d) has %lu particles\n", rank, i, j, local_bins_frame[i][j].particles.size());
+
+    // ===================== Sanity Check: After Distribution =====================
+    if (rank == 0) {
+        printf("\n[Sanity Check] Checking particle distances AFTER distribution...\n");
+
+        int total_within_cutoff_after = 0;
+        
+        // Compare all particles in bins
+        for (int i = 0; i < bin_count_x; i++) {
+            for (int j = 0; j < bin_count_y; j++) {
+                for (size_t p1 = 0; p1 < local_bins_frame[i][j].particles.size(); p1++) {
+                    for (size_t p2 = p1 + 1; p2 < local_bins_frame[i][j].particles.size(); p2++) {
+                        if (local_bins_frame[i][j].particles[p1].id == local_bins_frame[i][j].particles[p2].id) 
+                            continue;  // Skip self-comparison
+
+                        double dx = local_bins_frame[i][j].particles[p2].x - local_bins_frame[i][j].particles[p1].x;
+                        double dy = local_bins_frame[i][j].particles[p2].y - local_bins_frame[i][j].particles[p1].y;
+                        double r2 = dx * dx + dy * dy;
+
+                        if (r2 <= cutoff * cutoff) {
+                            total_within_cutoff_after++;
+                        }
+                    }
+                }
+            }
         }
-    }
+        printf("Rank 0: Total particle pairs within cutoff AFTER distribution: %d\n\n", total_within_cutoff_after);
+
+        if (total_within_cutoff != total_within_cutoff_after) {
+            printf("WARNING: Particle interactions BEFORE and AFTER distribution do NOT match!\n");
+        } else {
+            printf("Particle interactions BEFORE and AFTER distribution MATCH!\n");
+        }
+        // ===================== Sanity Check: After Distribution =====================
+
+    // // DEBUG
+    // MPI_Barrier(MPI_COMM_WORLD); // Ensure Rank 0's output is complete before others start
+
+    // for (int r = 0; r < num_procs; r++) {
+    //     if (r == rank) {
+    //         printf("\n--- Rank %d: Verifying Particles in Local Bins ---\n", rank);
+    //         int local_total_particles = 0;
     
+    //         for (int j = start_bin_yindex[rank]; j < end_bin_yindex[rank]; j++) {
+    //             int row_particles = 0;
+    //             for (int i = 0; i < bin_count_x; i++) {
+    //                 row_particles += local_bins_frame[i][j].particles.size();
+    //             }
+    //             local_total_particles += row_particles;
+    //             printf("Rank %d - Row %d: %d particles\n", rank, j, row_particles);
+    //         }
+    
+    //         printf("Rank %d: Total particles in assigned bins = %d\n", rank, local_total_particles);
+    //         fflush(stdout); // Ensure output is printed immediately
+    //     }
+    //     MPI_Barrier(MPI_COMM_WORLD); // Synchronize before next rank prints
+    // }
+    }
 }
 
 void compute_forces(int rank) {
+
+    // DEBUG
+    printf("Rank %d: Computing forces for particles in local bins...\n", rank);
 
     // Loop over all local bins
     for (int i = 0; i < bin_count_x; i++) {
         for (int j = 0; j < bin_count_y; j++) {
             for (auto& p : local_bins_frame[i][j].particles) {
-                p.ax = 0;
-                p.ay = 0;
+                // p.ax = 0;
+                // p.ay = 0;
 
                 // Compute forces within the same bin
-                for (auto& neighbor : local_bins_frame[i][j].particles) {
-                    if (p.id != neighbor.id) {
+                for (size_t n = 0; n < local_bins_frame[i][j].particles.size(); n++) {
+                    particle_t& neighbor = local_bins_frame[i][j].particles[n];
+                    if (p.id < neighbor.id) {  // Ensure each pair is processed only once
+
+                        // DEBUG
+                        printf("Rank %d: Particle %ld in Bin (%d, %d) checking interactions with %ld\n", 
+                               rank, p.id, i, j, neighbor.id);
+                        printf("Particle p (%f, %f) -> Particle neighbor (%f, %f)\n", 
+                               p.x, p.y, neighbor.x, neighbor.y);
+
                         apply_force(p, neighbor);
+
+                        //DEBUG
+                        printf("Rank %d: Particle %ld updated force -> ax: %.6f, ay: %.6f\n", 
+                               rank, p.id, p.ax, p.ay);                    
                     }
                 }
 
@@ -222,43 +366,57 @@ void compute_forces(int rank) {
                         int ni = i + dx;
                         int nj = j + dy;
 
-                        // Ensure within local bin bounds
-                        if (ni >= 0 && ni < bin_count_x && nj >= 0 && nj < bin_count_y) {
-                            for (auto neighbor : local_bins_frame[ni][nj].particles) {
-                                if (p.id != neighbor.id) {
+                        // Ensure within local bin bounds and avoid self-bin duplicate calculations
+                        if (ni >= 0 && ni < bin_count_x && nj >= 0 && nj < bin_count_y && (dx != 0 || dy != 0)) {
+                            for (auto& neighbor : local_bins_frame[ni][nj].particles) {
+                                if (p.id < neighbor.id) {  // Avoid duplicate interactions
+
+                                    // DEBUG
+                                    printf("Rank %d: Particle %ld in Bin (%d, %d) checking interactions with %ld\n", 
+                                           rank, p.id, i, j, neighbor.id);
+                                            
                                     apply_force(p, neighbor);
+
+                                    //DEBUG
+                                    printf("Rank %d: Particle %ld updated force -> ax: %.6f, ay: %.6f\n", 
+                                           rank, p.id, p.ax, p.ay);            
                                 }
                             }
                         }
                     }
                 }
 
-                // Handle ghost bins **ONLY for edge rows**
+                // Handle ghost bins **for edge interactions**
                 if (j == 0) {  // If in the first row, use ghost particles from above
                     for (auto& neighbor : ghost_bins_frame[i][0].particles) {
-                        apply_force(p, neighbor);
+                        if (p.id < neighbor.id) {
+                            apply_force(p, neighbor);
+                        }
                     }
                 }
-
                 if (j == bin_count_y - 1) {  // If in the last row, use ghost particles from below
                     for (auto& neighbor : ghost_bins_frame[i][1].particles) {
-                        apply_force(p, neighbor);
+                        if (p.id < neighbor.id) {
+                            apply_force(p, neighbor);
+                        }
                     }
                 }
-
-                // for (int i = 0; i < bin_count_x; i++) {
-                //     for (int j = 0; j < bin_count_y; j++) {
-                //         for (auto& p : local_bins_frame[i][j].particles) {
-                //             printf("Rank %d: Particle %d (%.3f, %.3f) -> ax: %.3f, ay: %.3f\n", 
-                //                     rank, p.id, p.x, p.y, p.ax, p.ay);
-                //         }
-                //     }
-                // }
-
             }
         }
     }
+
+    // DEBUG
+    for (int i = 0; i < bin_count_x; i++) {
+        for (int j = 0; j < bin_count_y; j++) {
+            for (const auto& p : local_bins_frame[i][j].particles) {
+                printf("Rank %d: Particle %ld in Bin (%d, %d) -> Final Force: ax = %.6f, ay = %.6f\n",
+                       rank, p.id, i, j, p.ax, p.ay);
+            }
+        }
+    }
+    
 }
+
 
 
 
@@ -300,6 +458,16 @@ void exchange_ghost_bins(int rank, int num_procs) {
     int send_below_size = send_below.size();
     int recv_above_size = 0, recv_below_size = 0;
 
+    // // Debug
+    // for (int r = 0; r < num_procs; r++) {
+    //     if (r == rank) {
+    //         printf("Rank %d: Preparing to send %ld particles above and %ld below\n", 
+    //             rank, send_above.size(), send_below.size());
+    //         fflush(stdout); // Ensure output is printed immediately
+    //     }
+    //     MPI_Barrier(MPI_COMM_WORLD); // Synchronize before next rank prints
+    // }
+
     MPI_Request reqs[4];
     MPI_Status stats[4];
 
@@ -321,6 +489,16 @@ void exchange_ghost_bins(int rank, int num_procs) {
 
     MPI_Waitall(4, reqs, stats);
 
+    // // Debug
+    // for (int r = 0; r < num_procs; r++) {
+    //     if (r == rank) {
+    //         printf("Rank %d: Received %d particles from above, %d from below\n", 
+    //             rank, recv_above_size, recv_below_size);
+    //         fflush(stdout); // Ensure output is printed immediately
+    //     }
+    //     MPI_Barrier(MPI_COMM_WORLD); // Synchronize before next rank prints
+    // }
+
     // Ensure correct allocation of receive buffers
     recv_above.resize(recv_above_size);  // Allocate memory
     recv_below.resize(recv_below_size);  // Allocate memory
@@ -336,23 +514,6 @@ void exchange_ghost_bins(int rank, int num_procs) {
                     recv_below.data(), recv_below_size, PARTICLE, below_rank, 2,
                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
-
-    if (above_rank != MPI_PROC_NULL) {
-        printf("Rank %d: Received %d particles from above\n", rank, recv_above_size);
-        for (const auto& p : recv_above) {
-            printf("  Received from above -> Particle (x: %.3f, y: %.3f, vx: %.3f, vy: %.3f)\n", 
-                   p.x, p.y, p.vx, p.vy);
-        }
-    }
-    
-    if (below_rank != MPI_PROC_NULL) {
-        printf("Rank %d: Received %d particles from below\n", rank, recv_below_size);
-        for (const auto& p : recv_below) {
-            printf("  Received from below -> Particle (x: %.3f, y: %.3f, vx: %.3f, vy: %.3f)\n", 
-                   p.x, p.y, p.vx, p.vy);
-        }
-    }
-    
     
     
     if (above_rank != MPI_PROC_NULL) {
@@ -371,11 +532,28 @@ void exchange_ghost_bins(int rank, int num_procs) {
         }
     }
 
-    for (int i = 0; i < bin_count_x; i++) {
-        printf("Rank %d: Ghost bin (%d, top) has %lu particles\n", rank, i, ghost_bins_frame[i][0].particles.size());
-        printf("Rank %d: Ghost bin (%d, bottom) has %lu particles\n", rank, i, ghost_bins_frame[i][1].particles.size());
-    }    
+    // // DEBUG
+    // for (int r = 0; r < num_procs; r++) {
+    //     if (r == rank) {
+    //         // Sum the total number of particles in the ghost bins
+    //         int total_top_ghost_particles = 0;
+    //         int total_bottom_ghost_particles = 0;
 
+    //         for (int i = 0; i < bin_count_x; i++) {
+    //             total_top_ghost_particles += ghost_bins_frame[i][0].particles.size();
+    //             total_bottom_ghost_particles += ghost_bins_frame[i][1].particles.size();
+    //         }
+
+    //         // Print the total number of ghost particles and compare with received counts
+    //         printf("Rank %d: Total particles in top ghost row: %d (Expected: %d)\n", 
+    //             rank, total_top_ghost_particles, recv_above_size);
+
+    //         printf("Rank %d: Total particles in bottom ghost row: %d (Expected: %d)\n", 
+    //             rank, total_bottom_ghost_particles, recv_below_size);
+                        
+    //     }
+    //     MPI_Barrier(MPI_COMM_WORLD); // Synchronize before next rank prints
+    // }
 }
 
 void move_particles(int rank, int num_procs, double size) {
@@ -477,13 +655,12 @@ void move_particles(int rank, int num_procs, double size) {
     }
 }
 
-
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
     // Write this function
 
     exchange_ghost_bins(rank, num_procs);
-    compute_forces(rank);
-    move_particles(rank, num_procs, size);
+    // compute_forces(rank);
+    // move_particles(rank, num_procs, size);
 }
 
 void gather_for_save(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
@@ -539,8 +716,9 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
         std::copy(all_particles.begin(), all_particles.end(), parts);
     }
 
-    if (rank == 0) {
-        printf("Rank 0: Gathered all %d particles for final output\n", num_parts);
-    }
+    // DEBUG
+    // if (rank == 0) {
+    //     printf("Rank 0: Gathered all %d particles for final output\n", num_parts);
+    // }
     
 }
