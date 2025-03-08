@@ -22,6 +22,7 @@ struct Bin {
 static std::vector<std::vector<Bin>> bins_frame_1;
 static std::vector<std::vector<Bin>>* current_bins;
 int bin_count_x, bin_count_y;
+double y_min, y_max, ext_y_min, ext_y_max;
 
 // Global vector holding the local copy of particles for this process
 static std::vector<particle_t> local_particles;
@@ -129,12 +130,12 @@ void build_bins(double size) {
 
 void init_simulation(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
     // Compute owned domain boundaries for this process (row decomposition)
-    double y_min = size * rank / num_procs;
-    double y_max = size * (rank + 1) / num_procs;
+    y_min = size * rank / num_procs;
+    y_max = size * (rank + 1) / num_procs;
 
     // Extend the domain by cutoff (clamping at 0 and size)
-    double ext_y_min = (y_min - cutoff < 0) ? 0 : y_min - cutoff;
-    double ext_y_max = (y_max + cutoff > size) ? size : y_max + cutoff;
+    ext_y_min = (y_min - cutoff < 0) ? 0 : y_min - cutoff;
+    ext_y_max = (y_max + cutoff > size) ? size : y_max + cutoff;
     
     local_particles.clear();
     for (int i = 0; i < num_parts; ++i) {
@@ -153,42 +154,27 @@ void init_simulation(particle_t *parts, int num_parts, double size, int rank, in
 }
 
 void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
-    double y_min = size * rank / num_procs;
-    double y_max = size * (rank + 1) / num_procs;
-
-    double ext_y_min = (y_min - cutoff < 0) ? 0 : y_min - cutoff;
-    double ext_y_max = (y_max + cutoff > size) ? size : y_max + cutoff;
-
     // Compute forces using optimized binning
     compute_forces();
 
-    // Move owned particles
-    std::vector<particle_t> owned;
+    // Move owned particles and partition into remaining and outgoing
+    std::vector<particle_t> remain, send_up, send_down;
     for (size_t i = 0; i < local_particles.size(); ++i) {
         double y = local_particles[i].y;
         if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
             (rank != num_procs - 1 && y >= y_min && y < y_max)) {
             move(local_particles[i], size);
-            owned.push_back(local_particles[i]);
-        }
-    }
 
-    // Partition owned particles into remaining and outgoing
-    std::vector<particle_t> remain;
-    std::vector<particle_t> send_up;   // particles with y >= y_max - cutoff
-    std::vector<particle_t> send_down; // particles with y <= y_min + cutoff
+            double y = local_particles[i].y;
+            if (y >= ext_y_min && y <= ext_y_max)
+                remain.push_back(local_particles[i]);
+            
+            if (y >= y_max - cutoff && rank < num_procs - 1)
+                send_up.push_back(local_particles[i]);
     
-    for (size_t i = 0; i < owned.size(); ++i) {
-        double y = owned[i].y;
-
-        if (y >= ext_y_min && y <= ext_y_max)
-            remain.push_back(owned[i]);
-        
-        if (y >= y_max - cutoff && rank < num_procs - 1)
-            send_up.push_back(owned[i]);
-
-        if (y <= y_min + cutoff && rank > 0)
-            send_down.push_back(owned[i]);
+            if (y <= y_min + cutoff && rank > 0)
+                send_down.push_back(local_particles[i]);
+        }
     }
 
     // Exchange particles with immediate neighbors
