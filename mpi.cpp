@@ -18,13 +18,13 @@ struct Bin {
     std::vector<particle_t*> particles;
 };
 
-// 2D grid of bins for two frames
-static std::vector<std::vector<Bin>> bins_frame_1;
-static std::vector<std::vector<Bin>>* current_bins;
-int bin_count_x, bin_count_y;
-double y_min, y_max, ext_y_min, ext_y_max;
+// 2D grid of bins
+static std::vector<std::vector<Bin>> bins;
+static std::vector<std::vector<Bin>>* bins_ptr;
+int start_bin, end_bin, bin_count_x, bin_count_y;
+double y_min, y_max, y_min_halo, y_max_halo;
 
-// Global vector holding the local copy of particles for this process
+// Vector of particles in this process's local memory
 static std::vector<particle_t> local_particles;
 
 // Apply the force from neighbor to particle
@@ -72,7 +72,7 @@ inline void move(particle_t& p, double size) {
 inline void get_bin_index(double x, double y, int& bx, int& by, double size) {
     // Compute bin indices
     bx = static_cast<int>(x / bin_size);
-    by = static_cast<int>(y / bin_size);
+    by = static_cast<int>(y / bin_size) - start_bin;
 
     // Ensure bin indices stay within valid range
     bx = std::max(0, std::min(bx, bin_count_x - 1));
@@ -92,7 +92,7 @@ inline void apply_force_binning(particle_t& particle, Bin& bin) {
 void compute_forces() {
     for (int i = 0; i < bin_count_x; ++i) {
         for (int j = 0; j < bin_count_y; ++j) {
-            Bin& bin = (*current_bins)[i][j];
+            Bin& bin = (*bins_ptr)[i][j];
 
             for (auto p : bin.particles) {
                 // Reset acceleration before force accumulation
@@ -103,7 +103,7 @@ void compute_forces() {
                         int ni = i + dx;
                         int nj = j + dy;
                         if (ni >= 0 && ni < bin_count_x && nj >= 0 && nj < bin_count_y) {
-                            apply_force_binning(*p, (*current_bins)[ni][nj]);
+                            apply_force_binning(*p, (*bins_ptr)[ni][nj]);
                         }
                     }
                 }
@@ -112,43 +112,45 @@ void compute_forces() {
     }
 }
 
-// Build the binning data structures from local_particles
+// Build the bins with local particles
 void build_bins(double size) {
+    // Clear the bins
     for (int i = 0; i < bin_count_x; ++i) {
         for (int j = 0; j < bin_count_y; ++j) {
-            (*current_bins)[i][j].particles.clear();
+            (*bins_ptr)[i][j].particles.clear();
         }
     }
     
-    // Insert pointers to local_particles into the appropriate bins.
+    // Insert particle pointers into bins
     for (size_t i = 0; i < local_particles.size(); ++i) {
         int bx, by;
         get_bin_index(local_particles[i].x, local_particles[i].y, bx, by, size);
-        (*current_bins)[bx][by].particles.push_back(&local_particles[i]);
+        (*bins_ptr)[bx][by].particles.push_back(&local_particles[i]);
     }
 }
 
 void init_simulation(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
-    // Compute owned domain boundaries for this process (row decomposition)
+    // Compute the domain and halo region boundaries for this process
     y_min = size * rank / num_procs;
     y_max = size * (rank + 1) / num_procs;
-
-    // Extend the domain by cutoff (clamping at 0 and size)
-    ext_y_min = (y_min - cutoff < 0) ? 0 : y_min - cutoff;
-    ext_y_max = (y_max + cutoff > size) ? size : y_max + cutoff;
+    y_min_halo = (y_min - cutoff < 0) ? 0 : y_min - cutoff;
+    y_max_halo = (y_max + cutoff > size) ? size : y_max + cutoff;
     
+    // Copy owned and ghost particles into this process's local memory
     local_particles.clear();
     for (int i = 0; i < num_parts; ++i) {
-        if (parts[i].y >= ext_y_min && parts[i].y <= ext_y_max)
+        if (parts[i].y >= y_min_halo && parts[i].y <= y_max_halo)
             local_particles.push_back(parts[i]);
     }
     
-    // Build the bins from the local particles.
+    // Initialize and build the bins
     bin_count_x = static_cast<int>(size / bin_size);
-    bin_count_y = static_cast<int>(size / bin_size);
+    start_bin = static_cast<int>(std::floor(y_min_halo / bin_size)); // First bin that overlaps
+    end_bin = static_cast<int>(std::ceil(y_max_halo / bin_size)); // First bin that does not overlap
+    bin_count_y = end_bin - start_bin;
 
-    bins_frame_1.assign(bin_count_x, std::vector<Bin>(bin_count_y));
-    current_bins = &bins_frame_1;
+    bins.assign(bin_count_x, std::vector<Bin>(bin_count_y));
+    bins_ptr = &bins;
 
     build_bins(size);
 }
@@ -161,17 +163,20 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     std::vector<particle_t> remain, send_up, send_down;
     for (size_t i = 0; i < local_particles.size(); ++i) {
         double y = local_particles[i].y;
+
+        // Ownership check
         if ((rank == num_procs - 1 && y >= y_min && y <= y_max) ||
             (rank != num_procs - 1 && y >= y_min && y < y_max)) {
             move(local_particles[i], size);
+            y = local_particles[i].y;
 
-            double y = local_particles[i].y;
-            if (y >= ext_y_min && y <= ext_y_max)
+            // Keep owned particles and owned particles that move into halo regions
+            if (y >= y_min_halo && y <= y_max_halo)
                 remain.push_back(local_particles[i]);
             
+            // Send owned particles that move into a neighbor's domain or halo region
             if (y >= y_max - cutoff && rank < num_procs - 1)
                 send_up.push_back(local_particles[i]);
-    
             if (y <= y_min + cutoff && rank > 0)
                 send_down.push_back(local_particles[i]);
         }
@@ -181,7 +186,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     std::vector<particle_t> recv_from_lower, recv_from_upper;
 
     // Upward exchange:
-    // All processors except the top-most send their upward-moving particles.
+    // All processors except the top-most send their upward-moving particles
     if (rank != num_procs - 1) {
         int count = send_up.size();
         MPI_Send(&count, 1, MPI_INT, rank + 1, 0, MPI_COMM_WORLD);
@@ -189,7 +194,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
             MPI_Send(send_up.data(), count, PARTICLE, rank + 1, 1, MPI_COMM_WORLD);
         }
     }
-    // All processors except the bottom-most receive from below.
+    // All processors except the bottom-most receive from below
     if (rank != 0) {
         int count;
         MPI_Recv(&count, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -200,7 +205,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
     }
 
     // Downward exchange:
-    // All processors except the bottom-most send their downward-moving particles.
+    // All processors except the bottom-most send their downward-moving particles
     if (rank != 0) {
         int count = send_down.size();
         MPI_Send(&count, 1, MPI_INT, rank - 1, 2, MPI_COMM_WORLD);
@@ -208,7 +213,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
             MPI_Send(send_down.data(), count, PARTICLE, rank - 1, 3, MPI_COMM_WORLD);
         }
     }
-    // All processors except the top-most receive from above.
+    // All processors except the top-most receive from above
     if (rank != num_procs - 1) {
         int count;
         MPI_Recv(&count, 1, MPI_INT, rank + 1, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -228,9 +233,7 @@ void simulate_one_step(particle_t *parts, int num_parts, double size, int rank, 
 }
 
 void gather_for_save(particle_t *parts, int num_parts, double size, int rank, int num_procs) {
-    double y_min = size * rank / num_procs;
-    double y_max = size * (rank + 1) / num_procs;
-
+    // Filter out ghost particles
     std::vector<particle_t> owned;
     for (size_t i = 0; i < local_particles.size(); ++i) {
         double y = local_particles[i].y;
@@ -239,38 +242,40 @@ void gather_for_save(particle_t *parts, int num_parts, double size, int rank, in
             owned.push_back(local_particles[i]);
         }
     }
-    
-    int local_owned = owned.size();
-    std::vector<int> recv_counts;
+
+    // Gather each processor's number of owned particles
+    int owned_count = owned.size();
+    std::vector<int> proc_part_counts;
     if (rank == 0) {
-        recv_counts.resize(num_procs);
+        proc_part_counts.resize(num_procs);
     }
-    MPI_Gather(&local_owned, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&owned_count, 1, MPI_INT, proc_part_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
     
+    // Compute displacements and initialize list for all particles
     std::vector<int> displs;
-    int total_owned = 0;
-    if (rank == 0) {
-        displs.resize(num_procs);
-        for (int i = 0; i < num_procs; ++i) {
-            displs[i] = total_owned;
-            total_owned += recv_counts[i];
-        }
-    }
-    
     std::vector<particle_t> all_particles;
     if (rank == 0) {
-        all_particles.resize(total_owned);
+        displs.resize(num_procs);
+        displs[0] = 0;
+
+        for (int i = 1; i < num_procs; ++i) {
+            displs[i] = proc_part_counts[i - 1] + displs[i - 1];
+        }
+
+        all_particles.resize(displs.back() + proc_part_counts.back());
     }
     
-    MPI_Gatherv(owned.data(), local_owned, PARTICLE,
-                all_particles.data(), recv_counts.data(), displs.data(), PARTICLE,
+    // Gather particles
+    MPI_Gatherv(owned.data(), owned_count, PARTICLE,
+                all_particles.data(), proc_part_counts.data(), displs.data(), PARTICLE,
                 0, MPI_COMM_WORLD);
     
+    // Sort particles and update parts
     if (rank == 0) {
-        std::sort(all_particles.begin(), all_particles.end(), [](const particle_t &a, const particle_t &b) {
-            return a.id < b.id;
-        });
-        for (int i = 0; i < total_owned && i < num_parts; ++i) {
+        std::sort(all_particles.begin(), all_particles.end(), 
+            [](const particle_t &a, const particle_t &b) { return a.id < b.id; }
+        );
+        for (int i = 0; i < num_parts; ++i) {
             parts[i] = all_particles[i];
         }
     }
